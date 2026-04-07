@@ -15,6 +15,7 @@ import 'package:image_picker/image_picker.dart';
 import 'package:syncfusion_flutter_pdf/pdf.dart';
 
 import 'gemma_vision_service.dart';
+import 'local_llm_service.dart';
 
 // ---------------------------------------------------------------------------
 // App entry-point
@@ -93,11 +94,12 @@ class _AppShellState extends State<AppShell> {
 }
 
 // ---------------------------------------------------------------------------
-// ImageInterpretationPage
+// ImageInterpretationPage — Cloud API or On-Device (GGUF + llama.cpp)
 // ---------------------------------------------------------------------------
 
-/// A dedicated page that lets the user take or pick a photo, then sends it
-/// to the Gemma vision API for free on-device interpretation.
+/// Which inference backend the user has selected.
+enum _InferenceBackend { cloud, onDevice }
+
 class ImageInterpretationPage extends StatefulWidget {
   const ImageInterpretationPage({super.key});
 
@@ -107,55 +109,73 @@ class ImageInterpretationPage extends StatefulWidget {
 }
 
 class _ImageInterpretationPageState extends State<ImageInterpretationPage> {
-  // ── Replace with your free key from https://aistudio.google.com/app/apikey
-  static const _apiKey = 'AIzaSyA9xGOimKTpYS7fRhYaevUXJ-YKETkma-k';
+  // ── Backend selector ──────────────────────────────────────────────────────
+
+  _InferenceBackend _backend = _InferenceBackend.cloud;
+
+  // ── Cloud (Gemma API) ─────────────────────────────────────────────────────
+
+  static const _defaultApiKey = 'AIzaSyA9xGOimKTpYS7fRhYaevUXJ-YKETkma-k';
+  final _apiKeyController = TextEditingController(text: _defaultApiKey);
+  late GemmaVisionService _cloudService = GemmaVisionService(
+    config: GemmaVisionConfig(apiKey: _defaultApiKey),
+  );
+  GemmaInterpretationResult? _cloudResult;
+
+  // ── On-device (GGUF + llama.cpp) ──────────────────────────────────────────
+
+  late final LocalLlmService _localService = LocalLlmService(
+    config: LocalLlmModelConfig.gemma3_270mItQ4Km,
+  );
+  LlmServiceState _localState = LlmServiceIdle();
+  final TextRecognizer _localImageTextRecognizer = TextRecognizer();
+  String _localResponse = '';
+  bool _localStreaming = false;
+
+  // ── Shared image state ────────────────────────────────────────────────────
 
   final _picker = ImagePicker();
   final _promptController = TextEditingController();
-  final _apiKeyController = TextEditingController(text: _apiKey);
-
-  late GemmaVisionService _service;
-
   Uint8List? _imageBytes;
   String? _imageMimeType;
   String? _imageName;
-
+  String? _imageFilePath;
   bool _isInterpreting = false;
-  GemmaInterpretationResult? _lastResult;
   String _statusMessage = 'Pick or capture an image to get started.';
+
+  // ── Lifecycle ─────────────────────────────────────────────────────────────
 
   @override
   void initState() {
     super.initState();
-    _service = GemmaVisionService(
-      config: GemmaVisionConfig(apiKey: _apiKey),
-    );
+    _localService.stateStream.listen((state) {
+      if (!mounted) return;
+      setState(() => _localState = state);
+    });
   }
 
   @override
   void dispose() {
     _promptController.dispose();
     _apiKeyController.dispose();
-    _service.dispose();
+    _cloudService.dispose();
+    _localImageTextRecognizer.close();
+    _localService.dispose();
     super.dispose();
   }
 
   // ── Image selection ───────────────────────────────────────────────────────
 
   Future<void> _pickFromGallery() async {
-    final file = await _picker.pickImage(
-      source: ImageSource.gallery,
-      imageQuality: 85,
-    );
+    final file =
+    await _picker.pickImage(source: ImageSource.gallery, imageQuality: 85);
     if (file == null || !mounted) return;
     await _loadPickedFile(file);
   }
 
   Future<void> _captureFromCamera() async {
-    final file = await _picker.pickImage(
-      source: ImageSource.camera,
-      imageQuality: 85,
-    );
+    final file =
+    await _picker.pickImage(source: ImageSource.camera, imageQuality: 85);
     if (file == null || !mounted) return;
     await _loadPickedFile(file);
   }
@@ -169,52 +189,55 @@ class _ImageInterpretationPageState extends State<ImageInterpretationPage> {
       'bmp' => 'image/bmp',
       _ => 'image/jpeg',
     };
-
     setState(() {
       _imageBytes = bytes;
       _imageMimeType = mime;
       _imageName = file.name;
-      _lastResult = null;
+      _imageFilePath = file.path;
+      _cloudResult = null;
+      _localResponse = '';
       _statusMessage =
       'Image loaded (${(bytes.length / 1024).toStringAsFixed(1)} KB). '
-          'Tap Interpret to send it to Gemma.';
+          'Tap Interpret to analyse.';
     });
   }
 
-  // ── Interpretation ────────────────────────────────────────────────────────
+  // ── Dispatch to active backend ────────────────────────────────────────────
 
   Future<void> _interpret() async {
-    final bytes = _imageBytes;
-    if (bytes == null) {
-      setState(() {
-        _statusMessage = 'Please select an image first.';
-      });
+    if (_imageBytes == null) {
+      setState(() => _statusMessage = 'Please select an image first.');
       return;
     }
+    if (_backend == _InferenceBackend.cloud) {
+      await _interpretCloud();
+    } else {
+      await _interpretLocal();
+    }
+  }
 
-    // Rebuild service if the user changed the API key in the settings field
+  // ── Cloud interpretation ──────────────────────────────────────────────────
+
+  Future<void> _interpretCloud() async {
     final key = _apiKeyController.text.trim();
     if (key.isEmpty) {
-      setState(() {
-        _statusMessage = 'Enter your Gemma API key above before interpreting.';
-      });
+      setState(() => _statusMessage =
+      'Enter your Gemma API key to use the cloud backend.');
       return;
     }
 
-    _service.dispose();
-    _service = GemmaVisionService(
-      config: GemmaVisionConfig(apiKey: key),
-    );
+    _cloudService.dispose();
+    _cloudService = GemmaVisionService(config: GemmaVisionConfig(apiKey: key));
 
     setState(() {
       _isInterpreting = true;
-      _lastResult = null;
-      _statusMessage = 'Sending image to Gemma ${_service.config.model}…';
+      _cloudResult = null;
+      _statusMessage = 'Sending to Gemma cloud API…';
     });
 
     final prompt = _promptController.text.trim();
-    final result = await _service.interpretImage(
-      imageBytes: bytes,
+    final result = await _cloudService.interpretImage(
+      imageBytes: _imageBytes!,
       mimeType: _imageMimeType ?? 'image/jpeg',
       prompt: prompt.isNotEmpty ? prompt : null,
     );
@@ -222,20 +245,114 @@ class _ImageInterpretationPageState extends State<ImageInterpretationPage> {
     if (!mounted) return;
     setState(() {
       _isInterpreting = false;
-      _lastResult = result;
+      _cloudResult = result;
       _statusMessage = switch (result) {
         GemmaInterpretationSuccess s =>
-        'Interpreted with ${s.model}'
+        'Cloud · ${s.model}'
             '${s.totalTokenCount != null ? ' · ${s.totalTokenCount} tokens' : ''}.',
         GemmaInterpretationApiError e =>
         'API error ${e.statusCode}: ${e.message}',
-        GemmaInterpretationException e =>
-        'Exception: ${e.error}',
+        GemmaInterpretationException e => 'Exception: ${e.error}',
       };
     });
   }
 
-  // ── UI ────────────────────────────────────────────────────────────────────
+  // ── On-device interpretation ──────────────────────────────────────────────
+
+  Future<void> _interpretLocal() async {
+    if (_localState is! LlmServiceReady) {
+      setState(() => _statusMessage = 'Loading on-device model…');
+      try {
+        await _localService.ensureModelAndLoad();
+      } catch (e) {
+        if (!mounted) return;
+        setState(() => _statusMessage = 'Model load failed: $e');
+        return;
+      }
+    }
+
+    final userPrompt = _promptController.text.trim();
+    final extractedText = await _extractLocalOcrText();
+    final fullPrompt = StringBuffer()
+      ..writeln(
+        'You are helping with document and screenshot interpretation on-device.',
+      )
+      ..writeln(
+        'The local Gemma 3 270M model is text-only, so answer using the OCR text and lightweight metadata below.',
+      )
+      ..writeln()
+      ..writeln('Image name: ${_imageName ?? 'unknown'}')
+      ..writeln('Mime type: ${_imageMimeType ?? 'unknown'}')
+      ..writeln()
+      ..writeln(
+        extractedText.isEmpty
+            ? 'OCR text: [none detected]'
+            : 'OCR text:\n$extractedText',
+      )
+      ..writeln()
+      ..writeln(userPrompt.isNotEmpty
+          ? userPrompt
+          : 'Summarize the document or screenshot, identify the likely content, and point out any important text.');
+
+    setState(() {
+      _isInterpreting = true;
+      _localStreaming = true;
+      _localResponse = '';
+      _statusMessage = 'Running on-device model…';
+    });
+
+    try {
+      _localService.generateStreaming(fullPrompt.toString()).listen(
+            (chunk) {
+          if (!mounted) return;
+          setState(() => _localResponse += chunk);
+        },
+        onDone: () {
+          if (!mounted) return;
+          setState(() {
+            _isInterpreting = false;
+            _localStreaming = false;
+            _statusMessage =
+                'On-device · ${_localService.config.useGpu ? 'GPU' : 'CPU'} · complete.';
+          });
+        },
+        onError: (Object e) {
+          if (!mounted) return;
+          setState(() {
+            _isInterpreting = false;
+            _localStreaming = false;
+            _localResponse = 'Error: $e';
+            _statusMessage = 'On-device generation failed.';
+          });
+        },
+      );
+    } catch (e) {
+      setState(() {
+        _isInterpreting = false;
+        _localStreaming = false;
+        _localResponse = 'Error: $e';
+        _statusMessage = 'On-device generation failed.';
+      });
+    }
+  }
+
+  Future<String> _extractLocalOcrText() async {
+    final imagePath = _imageFilePath;
+    if (imagePath == null || imagePath.isEmpty) {
+      return '';
+    }
+
+    try {
+      final inputImage = InputImage.fromFilePath(imagePath);
+      final recognizedText =
+          await _localImageTextRecognizer.processImage(inputImage);
+      return recognizedText.text.trim();
+    } catch (_) {
+      return '';
+    }
+  }
+
+  // ── Build ─────────────────────────────────────────────────────────────────
 
   @override
   Widget build(BuildContext context) {
@@ -261,29 +378,27 @@ class _ImageInterpretationPageState extends State<ImageInterpretationPage> {
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: <Widget>[
                   _buildHero(),
-                  const SizedBox(height: 20),
-                  LayoutBuilder(
-                    builder: (context, constraints) {
-                      final isWide = constraints.maxWidth > 720;
-                      if (isWide) {
-                        return Row(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: <Widget>[
-                            Expanded(flex: 5, child: _buildImagePanel()),
-                            const SizedBox(width: 20),
-                            Expanded(flex: 6, child: _buildResultPanel()),
-                          ],
-                        );
-                      }
-                      return Column(
+                  const SizedBox(height: 16),
+                  _buildBackendSelector(),
+                  const SizedBox(height: 16),
+                  LayoutBuilder(builder: (context, constraints) {
+                    final isWide = constraints.maxWidth > 720;
+                    if (isWide) {
+                      return Row(
+                        crossAxisAlignment: CrossAxisAlignment.start,
                         children: <Widget>[
-                          _buildImagePanel(),
-                          const SizedBox(height: 20),
-                          _buildResultPanel(),
+                          Expanded(flex: 5, child: _buildImagePanel()),
+                          const SizedBox(width: 20),
+                          Expanded(flex: 6, child: _buildResultPanel()),
                         ],
                       );
-                    },
-                  ),
+                    }
+                    return Column(children: <Widget>[
+                      _buildImagePanel(),
+                      const SizedBox(height: 20),
+                      _buildResultPanel(),
+                    ]);
+                  }),
                 ],
               ),
             ),
@@ -293,7 +408,10 @@ class _ImageInterpretationPageState extends State<ImageInterpretationPage> {
     );
   }
 
+  // ── Hero ──────────────────────────────────────────────────────────────────
+
   Widget _buildHero() {
+    final isCloud = _backend == _InferenceBackend.cloud;
     return Container(
       padding: const EdgeInsets.all(24),
       decoration: BoxDecoration(
@@ -312,23 +430,28 @@ class _ImageInterpretationPageState extends State<ImageInterpretationPage> {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: <Widget>[
           Container(
-            padding:
-            const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
             decoration: BoxDecoration(
-              color: const Color(0xFFDDF4EC),
+              color: isCloud
+                  ? const Color(0xFFDDF4EC)
+                  : const Color(0xFFEDE9FE),
               borderRadius: BorderRadius.circular(999),
             ),
-            child: const Text(
-              'AI Image Interpretation · Powered by Gemma',
+            child: Text(
+              isCloud
+                  ? 'AI Image Interpretation · Gemma Cloud API'
+                  : 'AI Image Interpretation · On-Device Gemma',
               style: TextStyle(
                 fontWeight: FontWeight.w700,
-                color: Color(0xFF115E59),
+                color: isCloud
+                    ? const Color(0xFF115E59)
+                    : const Color(0xFF4C1D95),
               ),
             ),
           ),
           const SizedBox(height: 16),
           const Text(
-            'Take or pick a photo, ask a question, and let Gemma describe what it sees.',
+            'Take or pick a photo, ask a question, and let Gemma help interpret it.',
             style: TextStyle(
               fontSize: 26,
               height: 1.15,
@@ -350,61 +473,153 @@ class _ImageInterpretationPageState extends State<ImageInterpretationPage> {
     );
   }
 
+  // ── Backend selector ──────────────────────────────────────────────────────
+
+  Widget _buildBackendSelector() {
+    return Container(
+      padding: const EdgeInsets.all(6),
+      decoration: BoxDecoration(
+        color: Colors.white.withValues(alpha: 0.92),
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(color: const Color(0xFFD7E7E3)),
+        boxShadow: const <BoxShadow>[
+          BoxShadow(
+            color: Color(0x100F172A),
+            blurRadius: 12,
+            offset: Offset(0, 6),
+          ),
+        ],
+      ),
+      child: Row(children: <Widget>[
+        Expanded(child: _backendTab(
+          value: _InferenceBackend.cloud,
+          icon: Icons.cloud_outlined,
+          label: 'Cloud API',
+          sublabel: 'Gemma via Google AI',
+          activeColor: const Color(0xFF115E59),
+          activeBg: const Color(0xFFDDF4EC),
+        )),
+        const SizedBox(width: 6),
+        Expanded(child: _backendTab(
+          value: _InferenceBackend.onDevice,
+          icon: Icons.memory_outlined,
+          label: 'On-Device',
+          sublabel: 'Gemma 270M + OCR context',
+          activeColor: const Color(0xFF4C1D95),
+          activeBg: const Color(0xFFEDE9FE),
+        )),
+      ]),
+    );
+  }
+
+  Widget _backendTab({
+    required _InferenceBackend value,
+    required IconData icon,
+    required String label,
+    required String sublabel,
+    required Color activeColor,
+    required Color activeBg,
+  }) {
+    final selected = _backend == value;
+    return GestureDetector(
+      onTap: () {
+        if (_backend == value) return;
+        setState(() {
+          _backend = value;
+          _cloudResult = null;
+          _localResponse = '';
+          _statusMessage = 'Switched to ${value == _InferenceBackend.cloud
+              ? 'cloud API'
+              : 'on-device'} mode.';
+        });
+      },
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 220),
+        curve: Curves.easeInOut,
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+        decoration: BoxDecoration(
+          color: selected ? activeBg : Colors.transparent,
+          borderRadius: BorderRadius.circular(14),
+          border: Border.all(
+            color: selected ? activeColor.withValues(alpha: 0.35) : Colors.transparent,
+          ),
+        ),
+        child: Row(children: <Widget>[
+          Icon(icon,
+              size: 22,
+              color: selected ? activeColor : const Color(0xFF94A3B8)),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: <Widget>[
+                Text(
+                  label,
+                  style: TextStyle(
+                    fontSize: 14,
+                    fontWeight: FontWeight.w700,
+                    color: selected ? activeColor : const Color(0xFF475569),
+                  ),
+                ),
+                Text(
+                  sublabel,
+                  style: TextStyle(
+                    fontSize: 11,
+                    color: selected
+                        ? activeColor.withValues(alpha: 0.75)
+                        : const Color(0xFF94A3B8),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          if (selected)
+            Icon(Icons.check_circle_rounded, size: 16, color: activeColor),
+        ]),
+      ),
+    );
+  }
+
+  // ── Image panel ───────────────────────────────────────────────────────────
+
   Widget _buildImagePanel() {
     return _panel(
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: <Widget>[
-          const Text(
-            'Image',
-            style: TextStyle(fontSize: 22, fontWeight: FontWeight.w800),
-          ),
+          const Text('Image',
+              style: TextStyle(fontSize: 22, fontWeight: FontWeight.w800)),
           const SizedBox(height: 16),
           _buildImagePreview(),
           const SizedBox(height: 16),
-          Wrap(
-            spacing: 12,
-            runSpacing: 12,
-            children: <Widget>[
-              FilledButton.icon(
-                onPressed: _isInterpreting ? null : _captureFromCamera,
-                icon: const Icon(Icons.camera_alt_outlined),
-                label: const Text('Camera'),
-              ),
-              OutlinedButton.icon(
-                onPressed: _isInterpreting ? null : _pickFromGallery,
-                icon: const Icon(Icons.photo_library_outlined),
-                label: const Text('Gallery'),
-              ),
-            ],
-          ),
-          const SizedBox(height: 24),
-          // API key field
-          const Text(
-            'Gemma API key',
-            style: TextStyle(fontWeight: FontWeight.w700),
-          ),
-          const SizedBox(height: 6),
-          TextField(
-            controller: _apiKeyController,
-            obscureText: true,
-            decoration: const InputDecoration(
-              border: OutlineInputBorder(),
-              hintText: 'Paste your Google AI Studio API key',
-              prefixIcon: Icon(Icons.vpn_key_outlined),
+          Wrap(spacing: 12, runSpacing: 12, children: <Widget>[
+            FilledButton.icon(
+              onPressed: _isInterpreting ? null : _captureFromCamera,
+              icon: const Icon(Icons.camera_alt_outlined),
+              label: const Text('Camera'),
             ),
+            OutlinedButton.icon(
+              onPressed: _isInterpreting ? null : _pickFromGallery,
+              icon: const Icon(Icons.photo_library_outlined),
+              label: const Text('Gallery'),
+            ),
+          ]),
+          const SizedBox(height: 24),
+
+          // ── Backend-specific settings ──
+          AnimatedSize(
+            duration: const Duration(milliseconds: 260),
+            curve: Curves.easeInOut,
+            child: _backend == _InferenceBackend.cloud
+                ? _buildCloudSettings()
+                : _buildLocalSettings(),
           ),
-          const SizedBox(height: 6),
-          const Text(
-            'Free key at aistudio.google.com/app/apikey',
-            style: TextStyle(fontSize: 12, color: Color(0xFF64748B)),
-          ),
+
           const SizedBox(height: 20),
-          // Custom prompt
-          const Text(
-            'Question / prompt (optional)',
-            style: TextStyle(fontWeight: FontWeight.w700),
-          ),
+
+          // Shared prompt field
+          const Text('Question / prompt (optional)',
+              style: TextStyle(fontWeight: FontWeight.w700)),
           const SizedBox(height: 6),
           TextField(
             controller: _promptController,
@@ -412,22 +627,26 @@ class _ImageInterpretationPageState extends State<ImageInterpretationPage> {
             decoration: const InputDecoration(
               border: OutlineInputBorder(),
               hintText:
-              'e.g. "What language is the text?" or leave blank for a full description.',
+              'e.g. "What language is the text?" — leave blank for a full description.',
             ),
           ),
           const SizedBox(height: 16),
+
           FilledButton.icon(
-            onPressed:
-            _isInterpreting || _imageBytes == null ? null : _interpret,
+            onPressed: _isInterpreting || _imageBytes == null
+                ? null
+                : _interpret,
+            style: FilledButton.styleFrom(
+              backgroundColor: _backend == _InferenceBackend.cloud
+                  ? const Color(0xFF115E59)
+                  : const Color(0xFF4C1D95),
+            ),
             icon: _isInterpreting
                 ? const SizedBox(
-              width: 18,
-              height: 18,
-              child: CircularProgressIndicator(
-                strokeWidth: 2,
-                color: Colors.white,
-              ),
-            )
+                width: 18,
+                height: 18,
+                child: CircularProgressIndicator(
+                    strokeWidth: 2, color: Colors.white))
                 : const Icon(Icons.auto_awesome),
             label: Text(_isInterpreting ? 'Interpreting…' : 'Interpret'),
           ),
@@ -436,9 +655,189 @@ class _ImageInterpretationPageState extends State<ImageInterpretationPage> {
     );
   }
 
+  Widget _buildCloudSettings() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: <Widget>[
+        const Text('Gemma API key',
+            style: TextStyle(fontWeight: FontWeight.w700)),
+        const SizedBox(height: 6),
+        TextField(
+          controller: _apiKeyController,
+          obscureText: true,
+          decoration: const InputDecoration(
+            border: OutlineInputBorder(),
+            hintText: 'Paste your Google AI Studio API key',
+            prefixIcon: Icon(Icons.vpn_key_outlined),
+          ),
+        ),
+        const SizedBox(height: 6),
+        const Text(
+          'Free key at aistudio.google.com/app/apikey',
+          style: TextStyle(fontSize: 12, color: Color(0xFF64748B)),
+        ),
+        const SizedBox(height: 8),
+        // Cloud status chip
+        _infoBadge(
+          icon: Icons.cloud_done_outlined,
+          text: 'Requires internet · no model download needed',
+          color: const Color(0xFFDDF4EC),
+          textColor: const Color(0xFF065F46),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildLocalSettings() {
+    final state = _localState;
+    final isReady = state is LlmServiceReady;
+    final isLoading = state is LlmServiceLoading;
+    final isPreparingAsset = state is LlmServicePreparingAsset;
+    final isError = state is LlmServiceError;
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: <Widget>[
+        const Text('On-device model',
+            style: TextStyle(fontWeight: FontWeight.w700)),
+        const SizedBox(height: 8),
+
+        // Status card
+        Container(
+          width: double.infinity,
+          padding: const EdgeInsets.all(14),
+          decoration: BoxDecoration(
+            color: isReady
+                ? const Color(0xFFEDE9FE)
+                : isError
+                ? const Color(0xFFFFF1F2)
+                : const Color(0xFFF8FAFC),
+            borderRadius: BorderRadius.circular(14),
+            border: Border.all(
+              color: isReady
+                  ? const Color(0xFF8B5CF6).withValues(alpha: 0.4)
+                  : isError
+                  ? const Color(0xFFFFCDD2)
+                  : const Color(0xFFE2E8F0),
+            ),
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: <Widget>[
+              Row(children: <Widget>[
+                Icon(
+                  isReady
+                      ? Icons.check_circle_outline
+                      : isError
+                      ? Icons.error_outline
+                      : isPreparingAsset
+                      ? Icons.inventory_2_outlined
+                      : Icons.hourglass_empty_outlined,
+                  size: 16,
+                  color: isReady
+                      ? const Color(0xFF4C1D95)
+                      : isError
+                      ? const Color(0xFFB91C1C)
+                      : isPreparingAsset
+                      ? const Color(0xFF6D28D9)
+                      : const Color(0xFF64748B),
+                ),
+                const SizedBox(width: 6),
+                Expanded(
+                  child: Text(
+                    switch (state) {
+                      LlmServiceIdle() =>
+                      'Model not loaded. Put the GGUF file in assets/models and tap "Load model".',
+                      LlmServicePreparingAsset(message: final message) =>
+                      message,
+                      LlmServiceLoading() =>
+                      'Loading model into ${_localService.config.useGpu ? 'GPU' : 'CPU'} memory…',
+                      LlmServiceReady() =>
+                      'Ready · ${_localService.config.useGpu ? 'GPU' : 'CPU'} · offline text reasoning',
+                      LlmServiceGenerating() => 'Generating response…',
+                      LlmServiceError(message: final m) =>
+                      'Error: $m',
+                    },
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: isReady
+                          ? const Color(0xFF4C1D95)
+                          : isError
+                          ? const Color(0xFF991B1B)
+                          : isPreparingAsset
+                          ? const Color(0xFF5B21B6)
+                          : const Color(0xFF475569),
+                    ),
+                  ),
+                ),
+              ]),
+              if (isPreparingAsset)
+                Padding(
+                  padding: const EdgeInsets.only(top: 8),
+                  child: LinearProgressIndicator(
+                    backgroundColor: const Color(0xFFE9D5FF),
+                    color: const Color(0xFF4C1D95),
+                  ),
+                ),
+              if (isLoading)
+                const Padding(
+                  padding: EdgeInsets.only(top: 8),
+                  child: LinearProgressIndicator(),
+                ),
+            ],
+          ),
+        ),
+
+        const SizedBox(height: 10),
+        if (!isReady && !isPreparingAsset && !isLoading)
+          OutlinedButton.icon(
+            onPressed: () async {
+              try {
+                await _localService.ensureModelAndLoad();
+              } catch (e) {
+                if (!mounted) return;
+                setState(() => _statusMessage = 'Load failed: $e');
+              }
+            },
+            icon: const Icon(Icons.download_outlined, size: 18),
+            label: const Text('Load model'),
+          ),
+        if (isReady)
+          _infoBadge(
+            icon: Icons.wifi_off_outlined,
+            text: 'Works offline for OCR-driven document reasoning',
+            color: const Color(0xFFEDE9FE),
+            textColor: const Color(0xFF4C1D95),
+          ),
+      ],
+    );
+  }
+
+  Widget _infoBadge({
+    required IconData icon,
+    required String text,
+    required Color color,
+    required Color textColor,
+  }) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      decoration: BoxDecoration(
+        color: color,
+        borderRadius: BorderRadius.circular(10),
+      ),
+      child: Row(children: <Widget>[
+        Icon(icon, size: 14, color: textColor),
+        const SizedBox(width: 6),
+        Expanded(
+          child: Text(text,
+              style: TextStyle(fontSize: 12, color: textColor)),
+        ),
+      ]),
+    );
+  }
+
   Widget _buildImagePreview() {
     final bytes = _imageBytes;
-
     if (bytes == null) {
       return Container(
         height: 220,
@@ -446,118 +845,138 @@ class _ImageInterpretationPageState extends State<ImageInterpretationPage> {
         decoration: BoxDecoration(
           color: const Color(0xFFF8FAFC),
           borderRadius: BorderRadius.circular(20),
-          border: Border.all(
-            color: const Color(0xFFCBD5E1),
-            style: BorderStyle.solid,
-          ),
+          border: Border.all(color: const Color(0xFFCBD5E1)),
         ),
         child: const Column(
           mainAxisAlignment: MainAxisAlignment.center,
           children: <Widget>[
             Icon(Icons.image_outlined, size: 48, color: Color(0xFF94A3B8)),
             SizedBox(height: 12),
-            Text(
-              'No image selected',
-              style: TextStyle(color: Color(0xFF64748B)),
-            ),
+            Text('No image selected',
+                style: TextStyle(color: Color(0xFF64748B))),
           ],
         ),
       );
     }
-
-    return Stack(
-      children: <Widget>[
-        ClipRRect(
-          borderRadius: BorderRadius.circular(20),
-          child: Image.memory(
-            bytes,
-            width: double.infinity,
-            fit: BoxFit.cover,
+    return Stack(children: <Widget>[
+      ClipRRect(
+        borderRadius: BorderRadius.circular(20),
+        child: Image.memory(bytes,
+            width: double.infinity, fit: BoxFit.cover),
+      ),
+      Positioned(
+        top: 10,
+        right: 10,
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+          decoration: BoxDecoration(
+            color: const Color(0xCC0F172A),
+            borderRadius: BorderRadius.circular(999),
           ),
-        ),
-        Positioned(
-          top: 10,
-          right: 10,
-          child: Container(
-            padding:
-            const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-            decoration: BoxDecoration(
-              color: const Color(0xCC0F172A),
-              borderRadius: BorderRadius.circular(999),
-            ),
-            child: Text(
-              _imageName ?? 'image',
+          child: Text(_imageName ?? 'image',
               style: const TextStyle(
-                color: Colors.white,
-                fontSize: 11,
-                fontWeight: FontWeight.w600,
-              ),
-            ),
-          ),
+                  color: Colors.white,
+                  fontSize: 11,
+                  fontWeight: FontWeight.w600)),
         ),
-      ],
-    );
+      ),
+    ]);
   }
+
+  // ── Result panel ──────────────────────────────────────────────────────────
 
   Widget _buildResultPanel() {
     return _panel(
       child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: <Widget>[
-      const Text(
-      "Gemma's response",
-      style: TextStyle(fontSize: 22, fontWeight: FontWeight.w800),
-    ),
-    const SizedBox(height: 16),
-    _buildResultContent(),
-    ],
-    ),
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: <Widget>[
+          Row(children: <Widget>[
+            Expanded(
+              child: Text(
+                _backend == _InferenceBackend.cloud
+                    ? 'Cloud response'
+                    : 'On-device response',
+                style: const TextStyle(
+                    fontSize: 22, fontWeight: FontWeight.w800),
+              ),
+            ),
+            // Tiny backend badge in the result header
+            Container(
+              padding:
+              const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+              decoration: BoxDecoration(
+                color: _backend == _InferenceBackend.cloud
+                    ? const Color(0xFFDDF4EC)
+                    : const Color(0xFFEDE9FE),
+                borderRadius: BorderRadius.circular(999),
+              ),
+              child: Row(children: <Widget>[
+                Icon(
+                  _backend == _InferenceBackend.cloud
+                      ? Icons.cloud_outlined
+                      : Icons.memory_outlined,
+                  size: 12,
+                  color: _backend == _InferenceBackend.cloud
+                      ? const Color(0xFF115E59)
+                      : const Color(0xFF4C1D95),
+                ),
+                const SizedBox(width: 4),
+                Text(
+                  _backend == _InferenceBackend.cloud ? 'Cloud' : 'On-device',
+                  style: TextStyle(
+                    fontSize: 11,
+                    fontWeight: FontWeight.w600,
+                    color: _backend == _InferenceBackend.cloud
+                        ? const Color(0xFF115E59)
+                        : const Color(0xFF4C1D95),
+                  ),
+                ),
+              ]),
+            ),
+          ]),
+          const SizedBox(height: 16),
+          _backend == _InferenceBackend.cloud
+              ? _buildCloudResult()
+              : _buildLocalResult(),
+        ],
+      ),
     );
   }
 
-  Widget _buildResultContent() {
+  Widget _buildCloudResult() {
     if (_isInterpreting) {
       return const Center(
         child: Padding(
           padding: EdgeInsets.symmetric(vertical: 48),
-          child: Column(
-            children: <Widget>[
-              CircularProgressIndicator(),
-              SizedBox(height: 16),
-              Text('Sending image to Gemma…'),
-            ],
-          ),
+          child: Column(children: <Widget>[
+            CircularProgressIndicator(),
+            SizedBox(height: 16),
+            Text('Sending image to Gemma cloud…'),
+          ]),
         ),
       );
     }
 
-    final result = _lastResult;
-
+    final result = _cloudResult;
     if (result == null) {
-      return Container(
-        width: double.infinity,
-        constraints: const BoxConstraints(minHeight: 160),
-        padding: const EdgeInsets.all(20),
-        decoration: BoxDecoration(
-          color: const Color(0xFF0F172A),
-          borderRadius: BorderRadius.circular(22),
-        ),
-        child: const Text(
-          'The interpretation will appear here after you tap Interpret.',
-          style: TextStyle(color: Color(0xFF64748B), fontSize: 15, height: 1.6),
-        ),
-      );
+      return _emptyResultBox('Cloud response will appear here after you tap Interpret.');
     }
 
     return switch (result) {
-      GemmaInterpretationSuccess s => _buildSuccessResult(s),
-      GemmaInterpretationApiError e => _buildErrorResult(
+      GemmaInterpretationSuccess s => _buildSuccessBox(
+        text: s.text,
+        badge: s.totalTokenCount != null
+            ? '${s.totalTokenCount} tokens · ${s.model}'
+            : s.model,
+        badgeIcon: Icons.cloud_outlined,
+      ),
+      GemmaInterpretationApiError e => _buildErrorBox(
         icon: Icons.cloud_off_outlined,
         title: 'API error ${e.statusCode}',
         body: e.message,
         detail: e.details,
       ),
-      GemmaInterpretationException e => _buildErrorResult(
+      GemmaInterpretationException e => _buildErrorBox(
         icon: Icons.error_outline,
         title: 'Unexpected error',
         body: e.error.toString(),
@@ -565,18 +984,71 @@ class _ImageInterpretationPageState extends State<ImageInterpretationPage> {
     };
   }
 
-  Widget _buildSuccessResult(GemmaInterpretationSuccess success) {
+  Widget _buildLocalResult() {
+    if (_isInterpreting && _localResponse.isEmpty) {
+      return const Center(
+        child: Padding(
+          padding: EdgeInsets.symmetric(vertical: 48),
+          child: Column(children: <Widget>[
+            CircularProgressIndicator(),
+            SizedBox(height: 16),
+            Text('On-device model is generating…'),
+          ]),
+        ),
+      );
+    }
+
+    if (_localResponse.isEmpty) {
+      return _emptyResultBox(
+          'On-device response will appear here after you tap Interpret.');
+    }
+
+    return _buildSuccessBox(
+      text: _localResponse,
+      badge: _localStreaming
+          ? 'Streaming…'
+          : '${_localService.config.useGpu ? 'GPU' : 'CPU'} · on-device',
+      badgeIcon: _localStreaming ? Icons.pending_outlined : Icons.memory_outlined,
+    );
+  }
+
+  Widget _emptyResultBox(String hint) {
+    return Container(
+      width: double.infinity,
+      constraints: const BoxConstraints(minHeight: 160),
+      padding: const EdgeInsets.all(20),
+      decoration: BoxDecoration(
+        color: const Color(0xFF0F172A),
+        borderRadius: BorderRadius.circular(22),
+      ),
+      child: Text(hint,
+          style: const TextStyle(
+              color: Color(0xFF64748B), fontSize: 15, height: 1.6)),
+    );
+  }
+
+  Widget _buildSuccessBox({
+    required String text,
+    required String badge,
+    required IconData badgeIcon,
+  }) {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: <Widget>[
-        // Token chip
-        if (success.totalTokenCount != null)
-          Chip(
-            avatar: const Icon(Icons.token_outlined, size: 16),
-            label: Text('${success.totalTokenCount} tokens · ${success.model}'),
-            backgroundColor: const Color(0xFFDDF4EC),
+        Chip(
+          avatar: Icon(badgeIcon, size: 14),
+          label: Text(badge),
+          backgroundColor: _backend == _InferenceBackend.cloud
+              ? const Color(0xFFDDF4EC)
+              : const Color(0xFFEDE9FE),
+          labelStyle: TextStyle(
+            fontSize: 12,
+            color: _backend == _InferenceBackend.cloud
+                ? const Color(0xFF065F46)
+                : const Color(0xFF4C1D95),
           ),
-        const SizedBox(height: 12),
+        ),
+        const SizedBox(height: 10),
         Container(
           width: double.infinity,
           constraints: const BoxConstraints(minHeight: 200),
@@ -586,18 +1058,15 @@ class _ImageInterpretationPageState extends State<ImageInterpretationPage> {
             borderRadius: BorderRadius.circular(22),
           ),
           child: SelectableText(
-            success.text,
+            text,
             style: const TextStyle(
-              color: Color(0xFFE2E8F0),
-              fontSize: 15,
-              height: 1.6,
-            ),
+                color: Color(0xFFE2E8F0), fontSize: 15, height: 1.6),
           ),
         ),
         const SizedBox(height: 12),
         OutlinedButton.icon(
           onPressed: () {
-            Clipboard.setData(ClipboardData(text: success.text));
+            Clipboard.setData(ClipboardData(text: text));
             ScaffoldMessenger.of(context).showSnackBar(
               const SnackBar(content: Text('Copied to clipboard')),
             );
@@ -609,7 +1078,7 @@ class _ImageInterpretationPageState extends State<ImageInterpretationPage> {
     );
   }
 
-  Widget _buildErrorResult({
+  Widget _buildErrorBox({
     required IconData icon,
     required String title,
     required String body,
@@ -623,38 +1092,27 @@ class _ImageInterpretationPageState extends State<ImageInterpretationPage> {
         borderRadius: BorderRadius.circular(22),
         border: Border.all(color: const Color(0xFFFFCDD2)),
       ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: <Widget>[
-          Row(
-            children: <Widget>[
-              Icon(icon, color: const Color(0xFFB91C1C), size: 20),
-              const SizedBox(width: 8),
-              Text(
-                title,
-                style: const TextStyle(
-                  fontWeight: FontWeight.w700,
-                  color: Color(0xFF7F1D1D),
-                ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 8),
-          Text(body, style: const TextStyle(color: Color(0xFF991B1B))),
-          if (detail != null) ...<Widget>[
-            const SizedBox(height: 6),
-            Text(
-              detail,
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: <Widget>[
+        Row(children: <Widget>[
+          Icon(icon, color: const Color(0xFFB91C1C), size: 20),
+          const SizedBox(width: 8),
+          Text(title,
               style: const TextStyle(
-                fontSize: 12,
-                color: Color(0xFFB91C1C),
-              ),
-            ),
-          ],
+                  fontWeight: FontWeight.w700, color: Color(0xFF7F1D1D))),
+        ]),
+        const SizedBox(height: 8),
+        Text(body, style: const TextStyle(color: Color(0xFF991B1B))),
+        if (detail != null) ...<Widget>[
+          const SizedBox(height: 6),
+          Text(detail,
+              style: const TextStyle(
+                  fontSize: 12, color: Color(0xFFB91C1C))),
         ],
-      ),
+      ]),
     );
   }
+
+  // ── Panel wrapper ─────────────────────────────────────────────────────────
 
   Widget _panel({required Widget child}) {
     return Container(
